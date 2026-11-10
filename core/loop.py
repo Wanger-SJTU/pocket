@@ -9,6 +9,7 @@ from typing import Any
 
 from config import Config
 from core.context import Context, Message
+from core.review import ReviewDecision, ReviewGate, ReviewRequest
 from llm.client import LLMClient, LLMResponse, ToolCall
 from tools.base import ToolRegistry
 
@@ -41,17 +42,21 @@ class AgentLoop:
         4. Stop on completion, max_steps, or unrecoverable error.
     """
 
-    def __init__(self, client: LLMClient, registry: ToolRegistry, config: Config) -> None:
+    def __init__(self, client: LLMClient, registry: ToolRegistry, config: Config,
+                 review_gate: ReviewGate | None = None) -> None:
         """Wire up dependencies.
 
         Args:
             client: LLM client (stub or real).
             registry: Available tools the agent may call.
             config: Runtime configuration.
+            review_gate: Optional pre-execution confirmation layer; None or
+                a disabled gate means tools run without review.
         """
         self.client = client
         self.registry = registry
         self.config = config
+        self.review_gate = review_gate
 
     def run(self, task: str) -> LoopResult:
         """Execute the agent loop for a user task.
@@ -103,6 +108,15 @@ class AgentLoop:
         call_id = call.id or uuid.uuid4().hex
         try:
             args: dict[str, Any] = _parse_args(call.arguments)
+            # ReviewGate: surface the plan before executing (sm.yw style).
+            if self.review_gate is not None and self.review_gate.enabled:
+                request = ReviewRequest(tool_name=call.name, arguments=args)
+                decision: ReviewDecision = self.review_gate.check(request)
+                if decision.action == "deny":
+                    logger.info("review denied %s: %s", call.name, decision.feedback)
+                    return f"review denied: {decision.feedback}. Revise your plan."
+                if decision.action == "modify" and decision.arguments is not None:
+                    args = decision.arguments
             output = self.registry.execute(call.name, args, timeout=self.config.tool_timeout_seconds)
             return output
         except KeyError as exc:
