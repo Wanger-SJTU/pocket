@@ -1,0 +1,24 @@
+{
+  "llm": {
+    "api_key": "your-api-key (leave empty and export LLM_API_KEY to keep the secret out of files)",
+    "base_url": "https://open.bigmodel.cn/api/paas/v4",
+    "model": "glm-4.6"
+  },
+  "task": "Read README.md and summarize it.",
+  "max_steps": 10,
+  "temperature": 0.2,
+  "context_token_limit": 0,
+  "review": { "enabled": false },
+  "sandbox": {
+    "backend": "local",
+    "workspace_root": "workspace",
+    "image": "python:3.12-slim",
+    "readonly": false,
+    "limits": {
+      "cpu_seconds": 10,
+      "memory_mb": 256,
+      "file_size_mb": 64,
+      "max_processes": 1024
+    }
+  }
+}

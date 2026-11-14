@@ -2,7 +2,7 @@
 
 经典 Agent Loop 框架骨架（Python，仅框架 + stub，可离线运行）。
 
-五层抽象，每层只依赖接口，可独立替换实现：
+六层抽象，每层只依赖接口，可独立替换实现：
 
 ```
 ┌────────────────────────────────────────────────────┐
@@ -25,27 +25,63 @@
 
 ```bash
 cd /home/wanger/codes/agent-loop
-python3 main.py          # stub LLM，无需 API key
+python3 main.py          # 无 API key 时自动用 stub LLM
 python3 -m gateway.demo  # IM 消息进出全流程演示（EchoGateway）
 ```
 
-接入真实 LLM：实现 `llm/client.py` 中的 `RealLLMClient`（见 TODO），在 `main.py` 替换注入。
+接入真实 LLM（任何 OpenAI 兼容端点：GLM / DeepSeek / OpenAI / 本地 vllm）——
+编辑 `~/.agent-loop/config.json`（模板见仓库 `config.example.json`）：
+
+```json
+{
+  "llm": {
+    "api_key": "your-key",
+    "base_url": "https://open.bigmodel.cn/api/paas/v4",
+    "model": "glm-4.6"
+  }
+}
+```
+
+```bash
+python3 main.py                        # 自动切换 RealLLMClient
+AGENT_TASK="另一个任务" python3 main.py   # 换任务（env 覆盖文件里的 task）
+```
+
+配置解析规则：
+
+- 文件搜索顺序：`AGENT_LOOP_CONFIG` 环境变量指定路径 > `~/.agent-loop/config.json`（用户级）> 仓库根 `config.json`（项目级覆盖，已 gitignore）
+- 环境变量永远覆盖文件值（`LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL`），key 可以只放 env、其余放文件
+- 文件里还可配 `task` / `max_steps` / `temperature` / `context_token_limit` / `review.enabled`
+- 文件缺失或损坏不是错误：告警后回退默认值 + stub，任务仍可运行
+
+离线验证真实 HTTP 代码路径（无需 key）：
+
+```bash
+python3 -m examples.mock_llm_server &   # 本地 OpenAI 兼容 mock（脚本化工具调用）
+LLM_API_KEY=x LLM_BASE_URL=http://127.0.0.1:8642/v4 python3 main.py
+```
 
 ## 目录结构
 
 ```
 agent-loop/
 ├── main.py                 # 入口：装配 Config + LLMClient + Tools + Loop
-├── config.py               # Config dataclass：max_steps、model、system_prompt 等
+├── config.py               # Config dataclass + JSON 配置加载（~/.agent-loop/config.json）
+├── config.example.json     # 配置模板（真实配置在 home，不入库）
 ├── core/
 │   ├── loop.py             # AgentLoop 主循环 + LoopResult
 │   └── context.py          # Message / Context：会话历史管理与序列化
 ├── llm/
-│   └── client.py           # LLMClient 抽象 + StubLLMClient（真实接入 TODO）
+│   └── client.py           # LLMClient 抽象 + StubLLMClient + RealLLMClient（OpenAI 兼容）
 ├── tools/
-│   ├── base.py             # Tool 基类、ToolSpec、ToolRegistry
-│   ├── examples.py         # 示例工具：read_file、run_command
+│   ├── base.py             # Tool 基类、ToolSpec、ToolRegistry（校验 + 超时强制）
+│   ├── examples.py         # 示例工具：read_file（根目录防护）、run_command（黑名单 → 沙盒）
 │   └── memory_tools.py     # memory_write / memory_search 工具
+├── sandbox/                # 沙盒层：命令执行的第二道墙
+│   ├── base.py             # Sandbox 抽象、SandboxResult、SandboxUnavailable
+│   ├── local.py            # LocalSandbox：workspace 白名单 + env 白名单 + rlimits + 进程组 kill
+│   ├── docker_backend.py   # DockerSandbox：docker run --rm --network none（CLI 子进程，无第三方依赖）
+│   └── factory.py          # create_sandbox：按 config 选后端，docker 不可用降级 local
 ├── harness/                # 外部 harness 调度层
 │   ├── base.py             # Harness 抽象、HarnessResult、HarnessRegistry
 │   ├── adapters.py         # ClaudeCode / Codex / OpenClaw stub（TODO: CLI 接入）
@@ -106,8 +142,10 @@ for tool in build_memory_tools(memory):
 ```
 
 - `InMemoryMemory`：关键词匹配打分，可直接跑
-- `FileMemory`：Markdown 文件存储（search TODO）
+- `FileMemory`：Markdown 文件存储 + 关键词检索（front matter 元数据）
 - 换向量库/SQLite 只需实现 `Memory` 接口
+- 上下文接近 token 上限（`Config.context_token_limit > 0`）时，loop 自动调用
+  `HeuristicSummarizer` 压缩旧历史（保留 system + 最近 N 条）
 
 ### 4. Gateway 层（gateway/）
 
@@ -132,13 +170,57 @@ IM 平台 ──事件──► Gateway（标准化 IncomingMessage）
 
 接真实 IM 只需实现对应 Gateway 的 `parse_event` + `send`，其余全复用。
 
+### 5. Sandbox 层（sandbox/）
+
+工具命令执行的双闸结构：黑名单是第一道闸（便宜的阵线，拦明显破坏性字符串），
+沙盒是第二道墙（即使黑名单漏拦也困得住）。工具只依赖 `Sandbox` 接口，
+后端在装配时选择，与 memory/harness 同一风格：
+
+```python
+from sandbox import create_sandbox
+
+sandbox = create_sandbox(config_sandbox_settings, workspace_root="workspace")
+# backend="docker" 但 daemon 不可用时自动降级为 local（带 warning）
+```
+
+```python
+result = sandbox.run(cmd, cwd=None, env=None, timeout=30.0)
+result.stdout / result.stderr / result.exit_code / result.timed_out / result.backend
+```
+
+三个后端：
+
+| backend | 隔离手段 | 适用 |
+|---|---|---|
+| `local` | cwd 白名单（workspace 内）+ env 白名单（防宿主 secrets 泄漏）+ rlimits（CPU/内存/文件大小/进程数）+ 超时进程组 kill | 默认；零依赖 |
+| `docker` | `docker run --rm --network none --memory/--cpus/--pids-limit`，workspace 挂载（可只读），容器内 nobody 用户，超时 `docker kill` | 最强墙；daemon 缺失抛 `SandboxUnavailable` 自动降级 |
+| `off` | 无隔离（开发专用；黑名单仍是唯一闸） | 仅可信环境调试 |
+
+config（见 `config.example.json` 的 `sandbox` 节）：
+
+```json
+{
+  "sandbox": {
+    "backend": "local",
+    "workspace_root": "workspace",
+    "image": "python:3.12-slim",
+    "readonly": false,
+    "limits": {"cpu_seconds": 10, "memory_mb": 256, "file_size_mb": 64, "max_processes": 1024}
+  }
+}
+```
+
+已知边界（写在代码注释里）：Linux 的 RLIMIT_NPROC 是 per-UID 而非 per-sandbox，
+宿主机进程多时上限必须高于当前进程数，否则子进程 fork 全挂；要硬性 per-sandbox
+进程上限请用 docker 后端（`--pids-limit` 是容器级的）。
+
+验证：`python3 tests/test_sandbox.py`（或 pytest），覆盖超时 kill、workspace 白名单拒绝、
+env 过滤、docker 不可用降级、容器内执行与容器超时 kill。
+
 ## 待实现点（TODO）
 
 - `gateway/im/*`：真实 IM 适配器（事件解析、签名验签、token 管理、附件上传下载）
 - `gateway/base.py`：异步 handler、背压/重试
-- `llm/client.py`：真实 provider 适配器（消息/工具格式映射、响应归一化）
-- `tools/base.py`：参数 jsonschema 校验、执行超时强制
-- `tools/examples.py`：路径白名单、命令黑名单/沙箱
-- `core/context.py`：超长工具输出截断、历史压缩
-- `memory/`：FileMemory.search、LLM 摘要、loop 接近 token 上限自动 compact
+- `memory/`：LLM 摘要（当前 HeuristicSummarizer 为抽取式）、向量/BM25 检索
 - `harness/`：异步派发、poll/cancel 实现
+- `llm/client.py`：流式输出（streaming）、多 choice、token 用量统计上报
